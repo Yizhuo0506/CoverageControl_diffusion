@@ -43,3 +43,20 @@ WeightDecay = 0.001
 BatchSize = 10
 NumEpochs = 15
 Momentum = 0.1
+
+[DiffusionModel]
+Dir = "${CoverageControl_ws}/lpac/models/diffusion"
+DModel           = 128      # token hidden dim
+NumHeads         = 4
+NumLayers        = 4
+HiddenMultiplier = 4       
+Dropout          = 0.0
+AttentionRadius  = 0.3      
+TimeEmbeddingDim = 128
+
+[DiffusionTraining]
+BatchSize         = 64
+NumEpochs         = 20
+LearningRate      = 1e-4
+WeightDecay       = 1e-6
+NumDiffusionSteps = 1000

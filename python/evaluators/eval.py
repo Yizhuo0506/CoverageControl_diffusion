@@ -20,6 +20,7 @@ from coverage_control import WorldIDF
 from coverage_control.algorithms import ControllerCVT
 from coverage_control.algorithms import ControllerNN
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class Evaluator:
     """
@@ -53,6 +54,9 @@ class Evaluator:
         self.num_envs = self.config["NumEnvironments"]
         self.num_steps = self.config["NumSteps"]
         os.makedirs(self.env_dir + "/init_maps", exist_ok=True)
+
+        # 用于保存每个 controller 的最终覆盖图
+        os.makedirs(self.eval_dir, exist_ok=True)
 
         self.columns = [
             BarColumn(bar_width=None),
@@ -92,7 +96,7 @@ class Evaluator:
                     env_main.WriteEnvironment(pos_file, env_file)
                     world_idf = env_main.GetWorldIDFObject()
 
-                # env_main.PlotInitMap(self.env_dir + "/init_maps", f"{env_count}")
+                env_main.PlotInitMap(self.env_dir + "/init_maps", f"{env_count}")
                 robot_init_pos = env_main.GetRobotPositions(force_no_noise=True)
 
                 for controller_id in range(self.num_controllers):
@@ -142,6 +146,15 @@ class Evaluator:
 
                         if converged:
                             break
+                    
+                    controller_name = self.controllers_configs[controller_id]["Name"]
+                    rel_dir = os.path.join(
+                            "lpac", "eval", controller_name, "final_maps"
+                        )
+                    abs_dir = os.path.join(REPO_ROOT, rel_dir)
+                    os.makedirs(abs_dir, exist_ok=True)
+                    rel_prefix = os.path.join(rel_dir, f"env{env_count:03d}")
+                    env.PlotSystemMap(rel_prefix)                
 
                     if controller_id == self.num_controllers - 1:
                         info = f"Controller {controller_id + 1}/{self.num_controllers}: {controller.name} "

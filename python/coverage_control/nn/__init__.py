@@ -8,6 +8,7 @@ from .data_loaders import *
 from .models.cnn import CNN
 from .models.lpac import LPAC
 from .trainers import TrainModel
+from .models.diffusion_policy import DiffusionPolicy
 
 __all__ = [
     "DataLoaderUtils",
@@ -18,5 +19,6 @@ __all__ = [
     "VoronoiGNNDataset",
     "CNN",
     "LPAC",
+    "DiffusionPolicy",
     "TrainModel",
 ]

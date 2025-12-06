@@ -33,6 +33,7 @@ from .. import CoverageEnvUtils
 from ..core import CoverageSystem
 from ..core import Parameters
 from ..core import PointVector
+from coverage_control.nn.models.diffusion_policy import DiffusionPolicy
 
 __all__ = ["ControllerCVT", "ControllerNN"]
 
@@ -104,6 +105,7 @@ class ControllerNN:
         self.config = config
         self.params = params
         self.name = self.config["Name"]
+        self.policy_type = self.config.get("PolicyType", "LPAC")
         self.use_cnn = self.config["UseCNN"]
         self.use_comm_map = self.config["UseCommMap"]
         self.cnn_map_size = self.config["CNNMapSize"]
@@ -119,9 +121,23 @@ class ControllerNN:
                     self.config["LearningParams"]
                     )
             self.learning_params = IOUtils.load_toml(self.learning_params_file)
-            self.model = cc_nn.LPAC(self.learning_params).to(self.device)
-            self.model.load_model(IOUtils.sanitize_path(self.config["ModelStateDict"]))
-
+            if self.policy_type == "LPAC":
+                self.model = cc_nn.LPAC(self.learning_params).to(self.device)
+                self.model.load_model(IOUtils.sanitize_path(self.config["ModelStateDict"]))
+            
+            elif self.policy_type == "Diffusion":
+                # 新增的DiffusionPolicy 的加载
+                ckpt_path = IOUtils.sanitize_path(self.config["ModelStateDict"])
+                ckpt = torch.load(ckpt_path, map_location=self.device)
+                
+                if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+                    state_dict = ckpt["model_state_dict"]
+                else:
+                    state_dict = ckpt
+                
+                self.model = DiffusionPolicy(self.learning_params).to(self.device)
+                self.model.load_state_dict(state_dict, strict=True)
+            
         self.actions_mean = self.model.actions_mean.to(self.device)
         self.actions_std = self.model.actions_std.to(self.device)
         self.model = self.model.to(self.device)
