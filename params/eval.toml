@@ -8,6 +8,7 @@ NumSteps = 600
 [[Controllers]]
 Name = "lpac"
 Type = "Learning"
+PolicyType = "LPAC"
 # ModelFile: "~/CoverageControl_ws/datsets/lpac/models/model_k3_1024.pt"
 ModelStateDict = "${CoverageControl_ws}/lpac/models/model_k3_1024_state_dict.pt"
 LearningParams = "${CoverageControl_ws}/lpac/params/learning_params.toml"
@@ -29,3 +30,13 @@ Type = "CVT"
 Name = "CentralizedCVT"
 Algorithm = "CentralizedCVT"
 Type = "CVT"
+
+[[Controllers]]
+Name = "diffusion"
+Type = "Learning"
+PolicyType = "Diffusion"
+ModelStateDict = "${CoverageControl_ws}/lpac/models/diffusion/diffusion_policy_best.pt"
+LearningParams = "${CoverageControl_ws}/lpac/params/learning_params.toml"
+UseCommMap = true
+UseCNN = true
+CNNMapSize = 32
