@@ -366,14 +366,20 @@ def main() -> None:
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            state_dict = model.state_dict()
+            if actions_mean is not None and actions_std is not None:
+                state_dict["actions_mean"] = actions_mean
+                state_dict["actions_std"] = actions_std
+
             torch.save(
                 {
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": state_dict,
                     "config": diff_model_cfg,
                     "training_cfg": diff_train_cfg,
                 },
                 best_model_path,
             )
+
             print(f"  -> Saved best model to: {best_model_path}")
 
     # Optional: test set evaluation

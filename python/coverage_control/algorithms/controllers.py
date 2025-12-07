@@ -206,7 +206,7 @@ class ControllerNN:
                     beta_end=beta_end,
                     device=self.device,
                 )
-
+                self.sampling_cfg = self.learning_params.get("DiffusionSampling", {})
             else:
                 raise ValueError(f"[ControllerNN] Unknown PolicyType: {self.policy_type}")
 
@@ -279,66 +279,59 @@ class ControllerNN:
 
         num_robots = env.GetNumRobots()
 
-        local_maps_list = []
-        obstacle_maps_list = []
-        positions_list = []
+        # === 1. 用和 DataGenerator / DiffusionDataset 一样的方式构造输入 ===
+        # raw_local_maps: (N, H_raw, W_raw)
+        raw_local_maps = CoverageEnvUtils.get_raw_local_maps(env, self.params)
+        raw_obstacle_maps = CoverageEnvUtils.get_raw_obstacle_maps(env, self.params)
 
-        # 1. 从 env 读取局部地图和机器人位置
-        for rid in range(num_robots):
-            # C++ 端 API: GetRobotLocalMap(self, rid) -> np.ndarray[float32[m, n]]
-            local_map_np = env.GetRobotLocalMap(rid)
-            obstacle_map_np = env.GetRobotObstacleMap(rid)
+        # DataGenerator 里是先在 dim0 堆叠若干步再 resize，这里我们只有 1 步，所以手动加一个 batch 维
+        raw_local_maps = raw_local_maps.unsqueeze(0)      # (1, N, H_raw, W_raw)
+        raw_obstacle_maps = raw_obstacle_maps.unsqueeze(0)  # (1, N, H_raw, W_raw)
 
-            local_maps_list.append(torch.from_numpy(local_map_np).float())
-            obstacle_maps_list.append(torch.from_numpy(obstacle_map_np).float())
+        # resize_maps 的行为和 data_generation.py 里完全一样：
+        # 输入 (B, N, H_raw, W_raw) -> 输出 (B * N, CNNMapSize, CNNMapSize)
+        resized_local = CoverageEnvUtils.resize_maps(
+            raw_local_maps, self.cnn_map_size
+        )  # (1 * N, H, W)
+        resized_obstacle = CoverageEnvUtils.resize_maps(
+            raw_obstacle_maps, self.cnn_map_size
+        )  # (1 * N, H, W)
 
-            pos_np = np.asarray(env.GetRobotPosition(rid), dtype=np.float32)  # (2,)
-            positions_list.append(torch.from_numpy(pos_np))
-
-        local_maps = torch.stack(local_maps_list, dim=0)       # (N, H_raw, W_raw)
-        obstacle_maps = torch.stack(obstacle_maps_list, dim=0) # (N, H_raw, W_raw)
-        positions = torch.stack(positions_list, dim=0)         # (N, 2)
-
-        # ---- 1.5 确保和训练时 CNN 输入尺寸一致：H = W = self.cnn_map_size ----
-        target_size = getattr(self, "cnn_map_size", 32)  # 默认 32，对应 learning_params 里的 CNNMapSize
-        if local_maps.dim() != 3:
-            raise RuntimeError(
-                f"[ControllerNN._diffusion_step] unexpected local_maps.shape={local_maps.shape}"
-            )
-
-        N, H_raw, W_raw = local_maps.shape
-
-        if H_raw != target_size or W_raw != target_size:
-            # (N, 1, H_raw, W_raw) -> 插值 -> (N, 1, target_size, target_size)
-            local_maps = F.interpolate(
-                local_maps.unsqueeze(1),
-                size=(target_size, target_size),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(1)
-            obstacle_maps = F.interpolate(
-                obstacle_maps.unsqueeze(1),
-                size=(target_size, target_size),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(1)
-            H, W = target_size, target_size
-        else:
-            H, W = H_raw, W_raw
-
-
-        # 2. 构造 DiffusionPolicy 所需的 coverage_maps: (B=1, N, C=4, H, W)
-        coverage_maps = torch.zeros(
-            (1, N, 4, H, W), dtype=torch.float32, device=self.device
+        # 还原成 (B=1, N, H, W)，再取出第 0 个 batch
+        resized_local = resized_local.view(
+            -1, num_robots, self.cnn_map_size, self.cnn_map_size
         )
-        coverage_maps[0, :, 0, :, :] = local_maps.to(self.device)
-        coverage_maps[0, :, 1, :, :] = obstacle_maps.to(self.device)
+        resized_obstacle = resized_obstacle.view(
+            -1, num_robots, self.cnn_map_size, self.cnn_map_size
+        )
 
-        # 通信图通道（第 3、4 个）目前暂时置 0；
-        # 若要严格对齐训练，可以后续根据 env.GetCommunicationMaps() 构造。
-        # comm_maps = env.GetCommunicationMaps()  # 若需要，可在这里用
+        local_maps = resized_local[0]      # (N, H, W)
+        obstacle_maps = resized_obstacle[0]  # (N, H, W)
 
-        positions = positions.unsqueeze(0).to(self.device)  # (1, N, 2)
+        # === 2. 构造 coverage_maps 通道，和 DiffusionDataset 完全一致 ===
+        # DiffusionDataset 里：UseCommMaps = True -> C = 4；否则 C = 2
+        C = 4 if self.use_comm_map else 2
+        coverage_maps = torch.zeros(
+            (1, num_robots, C, self.cnn_map_size, self.cnn_map_size),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        coverage_maps[0, :, 0] = local_maps.to(self.device)
+        coverage_maps[0, :, 1] = obstacle_maps.to(self.device)
+
+        if self.use_comm_map:
+            # 和 data_generation.py 中完全同一个函数
+            # 返回形状: (N, 2, H, W)
+            comm_maps = CoverageEnvUtils.get_communication_maps(
+                env, self.params, self.cnn_map_size
+            )
+            coverage_maps[0, :, 2:4] = comm_maps.to(self.device)
+
+        # === 3. 机器人位置，同样用 CoverageEnvUtils，和数据集一致 ===
+        # DataGenerator 里: self.robot_positions[count] = CoverageEnvUtils.get_robot_positions(self.env)
+        positions = CoverageEnvUtils.get_robot_positions(env)  # (N, 2) 的 torch.Tensor
+        positions = positions.unsqueeze(0).to(self.device)     # (1, N, 2)
+
 
         # 3. 反向扩散采样：从 x_T ~ N(0, I) 迭代到 x_0
         diff = self.diffusion
@@ -348,6 +341,7 @@ class ControllerNN:
         alpha_cumprod = diff["alpha_cumprod"]
 
         B = 1
+        N = num_robots 
         actions = torch.randn((B, N, 2), device=self.device)  # x_T
 
         for step_t in reversed(range(num_steps)):
@@ -365,13 +359,13 @@ class ControllerNN:
             coef2 = (1.0 - alpha_t) / sqrt_one_minus_alpha_bar_t
 
             mean = coef1 * (actions - coef2 * eps_hat)
-
-            if step_t > 0:
+            noise_scale = self.sampling_cfg.get("NoiseScale", 0.0) 
+            if step_t > 0 and noise_scale > 0.0:
                 noise = torch.randn_like(actions)
                 sigma_t = torch.sqrt(beta_t)
-                actions = mean + sigma_t * noise
+                actions = mean + noise_scale * sigma_t * noise
             else:
-                actions = mean  # t == 0
+                actions = mean
 
         # 4. 反归一化
         if self.actions_mean is not None and self.actions_std is not None:
