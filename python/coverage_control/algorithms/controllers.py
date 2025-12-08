@@ -39,7 +39,7 @@ import torch.nn.functional as F
 
 __all__ = ["ControllerCVT", "ControllerNN"]
 
-import numpy as np  # 新增
+import numpy as np  
 
 def build_diffusion_schedule(
     num_steps: int,
@@ -47,10 +47,7 @@ def build_diffusion_schedule(
     beta_end: float = 2e-2,
     device: torch.device | str | None = None,
 ):
-    """
-    创建与 train_diffusion.py 中一致的线性 beta 调度。
-    只用到 betas, alphas, alpha_cumprod 就够了。
-    """
+
     if device is None:
         device = "cpu"
 
@@ -132,7 +129,7 @@ class ControllerNN:
         self.config = config
         self.params = params
         self.name = self.config["Name"]
-        # PolicyType: "LPAC"（默认）或 "DIFFUSION"
+        # PolicyType: "LPAC" 或 "DIFFUSION"
         self.policy_type = str(self.config.get("PolicyType", "LPAC")).upper()
 
         self.use_cnn = self.config["UseCNN"]
@@ -148,9 +145,6 @@ class ControllerNN:
         # 扩散调度结构，只在 DIFFUSION 模式下用
         self.diffusion: dict | None = None
 
-        # --------------------------------------------------------------
-        # 1) 如果配置里给的是 ModelFile（原作者 JIT 导出的那种）
-        # --------------------------------------------------------------
         if "ModelFile" in self.config:
             self.model_file = IOUtils.sanitize_path(self.config["ModelFile"])
             # 作者这里用的是 torch.load（而不是 torch.jit.load），我们保持行为一致
@@ -163,7 +157,6 @@ class ControllerNN:
             self.learning_params = IOUtils.load_toml(self.learning_params_file)
 
             if self.policy_type == "LPAC":
-                # 原始 LPAC GNN policy，保持不变
                 self.model = cc_nn.LPAC(self.learning_params).to(self.device)
                 # LPAC 内部的 load_model 会自己处理 state_dict 和 actions_mean/std
                 self.model.load_model(IOUtils.sanitize_path(self.config["ModelStateDict"]))
@@ -171,7 +164,6 @@ class ControllerNN:
                 self.actions_std = self.model.actions_std.to(self.device)
 
             elif self.policy_type == "DIFFUSION":
-                # 我们训练好的 DiffusionPolicy
                 ckpt_path = IOUtils.sanitize_path(self.config["ModelStateDict"])
                 ckpt = torch.load(ckpt_path, map_location=self.device)
 
@@ -195,7 +187,7 @@ class ControllerNN:
                 if missing:
                     print(f"[DiffusionPolicy] Missing keys (usually fine): {missing}")
 
-                # 构造扩散调度（与 train_diffusion.py 一致）
+                # 构造扩散调度
                 diff_train_cfg = self.learning_params.get("DiffusionTraining", {})
                 num_steps = int(diff_train_cfg.get("NumDiffusionSteps", 1000))
                 beta_start = float(diff_train_cfg.get("BetaStart", 1e-4))
@@ -215,9 +207,7 @@ class ControllerNN:
         self.model.eval()
         self.model = torch.compile(self.model, dynamic=True)
 
-    # ------------------------------------------------------------------
-    # ControllerNN.step: 根据 policy_type 分别处理 LPAC / Diffusion
-    # ------------------------------------------------------------------
+
     def step(self, env: CoverageSystem) -> (float, bool):
         """
         Step function for the neural network controller
@@ -267,9 +257,7 @@ class ControllerNN:
         converged = torch.allclose(actions, torch.zeros_like(actions), atol=1e-5)
         return objective_value, converged
 
-    # ------------------------------------------------------------------
-    # 私有函数：在当前 env 状态下跑一条扩散采样链，得到 a_0
-    # ------------------------------------------------------------------
+    # 在当前 env 状态下跑一条扩散采样链，得到 a_0
     def _diffusion_step(self, env: CoverageSystem) -> torch.Tensor:
         """
         使用当前环境状态，跑一次完整的反向扩散链，输出当前时刻的动作 a_0。

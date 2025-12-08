@@ -82,7 +82,6 @@ class DiffusionPolicy(nn.Module):
         self.time_dim = time_dim
 
         # Multi-layer Transformer encoder over all agents
-        # 所有 robot (B * N) 展成一条序列，batch_size=1，
         # 用 block-diagonal 的 attention mask 控制“只在同一个图、且局部邻域内”互相注意。
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
