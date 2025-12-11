@@ -115,7 +115,7 @@ class GaussianDiffusion(nn.Module):
         # 估计 x0
         x0_pred = (x_t - torch.sqrt(1.0 - alpha_bar_t) * eps_hat) / torch.sqrt(alpha_bar_t)
 
-        # DDIM 的 sigma_t（控制随机性）【公式参考 DDIM 论文与后续教程】:contentReference[oaicite:2]{index=2}
+        # DDIM 的 sigma_t（控制随机性）
         sigma_t = (
             eta
             * torch.sqrt((1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t))
@@ -833,7 +833,6 @@ class DiffusionPolicy(nn.Module):
         for t_scalar in timesteps:
             t_batch = torch.full((B,), int(t_scalar), device=device, dtype=torch.long)
 
-            # 与训练时完全一致的调用方式
             eps_hat = self(
                 coverage_maps=coverage_maps,
                 actions_t=x_t,
@@ -849,5 +848,5 @@ class DiffusionPolicy(nn.Module):
                 eta=eta,
             )
 
-        # 循环结束时的 x_t 就是 u_0 的估计
+        # u_0 的估计
         return x_t
