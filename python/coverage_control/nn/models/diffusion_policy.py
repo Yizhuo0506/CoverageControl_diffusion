@@ -91,43 +91,23 @@ class GaussianDiffusion(nn.Module):
 
     # ---- reverse DDIM step u_t -> u_{t-1} ----
     @torch.no_grad()
-    def ddim_step(
-        self,
-        x_t: torch.Tensor,            # (B, N, 2)
-        t: torch.Tensor,              # (B,)
-        eps_hat: torch.Tensor,        # (B, N, 2), model's predicted noise
-        eta: float = 0.0,
-    ) -> torch.Tensor:
-        """
-        Single DDIM update step, following Song et al. (2020) [DDIM].
+    def ddim_step(self, x_t, t, t_prev, eps_hat, eta: float = 0.0):
+        alpha_bar_t    = self._extract(self.alphas_cumprod, t, x_t.shape)
+        alpha_bar_prev = self._extract(self.alphas_cumprod, t_prev, x_t.shape)
 
-        For eta = 0:
-            x_{t-1} = sqrt(ᾱ_{t-1}) * x0_hat + sqrt(1 - ᾱ_{t-1}) * eps_hat
-
-        For eta in (0, 1], we add extra stochasticity as in the DDIM paper.
-        """
-        # 当前和前一时刻的 ᾱ_t
-        alpha_bar_t = self._extract(self.alphas_cumprod, t, x_t.shape)  # ᾱ_t
-
-        t_prev = torch.clamp(t - 1, min=0)
-        alpha_bar_prev = self._extract(self.alphas_cumprod, t_prev, x_t.shape)  # ᾱ_{t-1}
-
-        # 估计 x0
         x0_pred = (x_t - torch.sqrt(1.0 - alpha_bar_t) * eps_hat) / torch.sqrt(alpha_bar_t)
 
-        # DDIM 的 sigma_t（控制随机性）
         sigma_t = (
             eta
             * torch.sqrt((1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t))
             * torch.sqrt(1.0 - alpha_bar_t / alpha_bar_prev)
         )
 
-        # 主方向项 + 随机噪声（eta=0 时 sigma_t=0，退化为 deterministic DDIM）
-        noise = torch.randn_like(x_t) if eta > 0.0 else 0.0
+        noise = torch.randn_like(x_t) if eta > 0.0 else torch.zeros_like(x_t)
         dir_xt = torch.sqrt(torch.clamp(1.0 - alpha_bar_prev - sigma_t**2, min=0.0)) * eps_hat
 
-        x_prev = torch.sqrt(alpha_bar_prev) * x0_pred + dir_xt + sigma_t * noise
-        return x_prev
+        return torch.sqrt(alpha_bar_prev) * x0_pred + dir_xt + sigma_t * noise
+
 
     # ---- time subsequence for fast DDIM sampling ----
     def get_sampling_timesteps(
@@ -191,155 +171,104 @@ class GaussianDiffusion(nn.Module):
 
 class RotaryMultiHeadAttention(nn.Module):
     """
-    Multi-head attention with 1D Rotary Positional Embeddings (RoPE).
-
-    RoPE is applied on the query and key projections using a scalar position
-    derived from the robot 2D coordinates. This keeps the implementation
-    simple while encoding relative displacements between robots.
+    Multi-head attention with 2D disentangled RoPE:
+      - head_dim split into two planes: x-plane and y-plane (each = head_dim/2)
+      - within each plane, apply standard RoPE on (even, odd) pairs
     """
-
     def __init__(
         self,
         d_model: int,
         num_heads: int,
         dropout: float = 0.0,
         rope_base_theta: float = 10_000.0,
+        rope_period: float = 1024.0,
+        use_rope: bool = True,
     ) -> None:
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-        assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
+        assert self.head_dim % 4 == 0, "2D disentangled RoPE requires head_dim % 4 == 0"
+
+        self.use_rope = bool(use_rope)
 
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
-
-        inv_freq = rope_base_theta ** (
-            -2.0 * torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
         self.dropout = nn.Dropout(dropout)
 
-    # ---------------- RoPE utilities ----------------
-    def _pos_to_scalar(self, positions: torch.Tensor) -> torch.Tensor:
-        """
-        Map 2D positions to a 1D scalar used by RoPE.
+        plane_dim = self.head_dim // 2
+        inv_freq = 1.0 / (rope_base_theta ** (torch.arange(0, plane_dim, 2, dtype=torch.float32) / plane_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.rope_scale = (2.0 * math.pi) / float(rope_period)
 
-        For coverage control, positions are in a 2D plane. We use a simple
-        linear projection (x + y) which preserves relative differences.
-        """
-        # positions: (B, N, 2)
-        return positions[..., 0] + positions[..., 1]  # (B, N)
+    def _sin_cos(self, angles: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # angles: (B, N) -> (B, 1, N, plane_dim/2)
+        freqs = torch.einsum("bn,d->bnd", angles.to(self.inv_freq.dtype), self.inv_freq)
+        return freqs.sin().unsqueeze(1), freqs.cos().unsqueeze(1)
 
-    def _get_sin_cos(self, pos_scalar: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute sine and cosine tensors for RoPE.
+    @staticmethod
+    def _rotate_pairs(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.Tensor:
+        # x: (B, H, N, plane_dim)
+        x0 = x[..., 0::2]
+        x1 = x[..., 1::2]
+        y0 = x0 * cos - x1 * sin
+        y1 = x0 * sin + x1 * cos
+        return torch.stack([y0, y1], dim=-1).flatten(-2)
 
-        Args:
-            pos_scalar: (B, N) scalar positions
+    def _apply_rope_2d(self, x: torch.Tensor, pos_2d: torch.Tensor) -> torch.Tensor:
+        # x: (B, H, N, head_dim), pos_2d: (B, N, 2)
+        plane_dim = x.shape[-1] // 2
+        ang_x = pos_2d[..., 0] * self.rope_scale
+        ang_y = pos_2d[..., 1] * self.rope_scale
 
-        Returns:
-            sin, cos: each of shape (B, 1, N, head_dim/2)
-        """
-        # (B, N, head_dim/2)
-        freqs = torch.einsum("bn,d->bnd", pos_scalar, self.inv_freq)
-        sin = freqs.sin().unsqueeze(1)  # (B, 1, N, D/2)
-        cos = freqs.cos().unsqueeze(1)  # (B, 1, N, D/2)
-        return sin, cos
+        sin_x, cos_x = self._sin_cos(ang_x)
+        sin_y, cos_y = self._sin_cos(ang_y)
 
-    def _apply_rope(
-        self, x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Apply RoPE to query or key tensor.
+        x_plane, y_plane = x.split(plane_dim, dim=-1)
+        x_plane = self._rotate_pairs(x_plane, sin_x, cos_x)
+        y_plane = self._rotate_pairs(y_plane, sin_y, cos_y)
+        return torch.cat([x_plane, y_plane], dim=-1)
 
-        Args:
-            x:   (B, H, N, D)
-            sin: (B, 1, N, D/2)
-            cos: (B, 1, N, D/2)
-
-        Returns:
-            rotated x with the same shape.
-        """
-        x_even = x[..., 0::2]
-        x_odd = x[..., 1::2]
-
-        # Broadcast sin, cos over heads
-        x_rot_even = x_even * cos - x_odd * sin
-        x_rot_odd = x_even * sin + x_odd * cos
-
-        x_rot = torch.stack([x_rot_even, x_rot_odd], dim=-1)  # (B, H, N, D/2, 2)
-        x_rot = x_rot.flatten(-2)  # (B, H, N, D)
-        return x_rot
-
-    # ---------------- main forward ----------------
     def forward(
         self,
-        x: torch.Tensor,
-        q_positions: torch.Tensor,
-        kv_positions: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        kv: Optional[torch.Tensor] = None,
+        x: torch.Tensor,                           # (B, Nq, d_model)
+        q_positions: torch.Tensor,                 # (B, Nq, 2)
+        kv_positions: torch.Tensor,                # (B, Nk, 2)
+        attn_mask: Optional[torch.Tensor] = None,  # (B, Nq, Nk), additive 0/-inf
+        kv: Optional[torch.Tensor] = None,         # (B, Nk, d_model)
     ) -> torch.Tensor:
-        """
-        Multi-head attention with RoPE.
-
-        Args:
-            x:            (B, Nq, d_model) query input
-            q_positions:  (B, Nq, 2) positions for queries
-            kv_positions: (B, Nk, 2) positions for keys/values
-            attn_mask:    optional (B, Nq, Nk) additive mask (0 or -inf)
-            kv:           optional (B, Nk, d_model) key/value input.
-                          If None, self-attention is used with kv == x.
-
-        Returns:
-            out:          (B, Nq, d_model)
-        """
-        B, Nq, _ = x.shape
         if kv is None:
             kv = x
-            Nk = Nq
-        else:
-            Nk = kv.shape[1]
 
-        # Linear projections
-        q = self.q_proj(x)   # (B, Nq, d_model)
-        k = self.k_proj(kv)  # (B, Nk, d_model)
-        v = self.v_proj(kv)  # (B, Nk, d_model)
+        B, Nq, _ = x.shape
+        Nk = kv.shape[1]
 
-        # Reshape to (B, H, N, D)
-        H = self.num_heads
-        D = self.head_dim
-        q = q.view(B, Nq, H, D).transpose(1, 2)  # (B, H, Nq, D)
-        k = k.view(B, Nk, H, D).transpose(1, 2)  # (B, H, Nk, D)
-        v = v.view(B, Nk, H, D).transpose(1, 2)  # (B, H, Nk, D)
+        q = self.q_proj(x)
+        k = self.k_proj(kv)
+        v = self.v_proj(kv)
 
-        # RoPE on queries and keys
-        q_pos_scalar = self._pos_to_scalar(q_positions)      # (B, Nq)
-        k_pos_scalar = self._pos_to_scalar(kv_positions)     # (B, Nk)
-        sin_q, cos_q = self._get_sin_cos(q_pos_scalar)       # (B,1,Nq,D/2)
-        sin_k, cos_k = self._get_sin_cos(k_pos_scalar)       # (B,1,Nk,D/2)
-        q = self._apply_rope(q, sin_q, cos_q)
-        k = self._apply_rope(k, sin_k, cos_k)
+        H, D = self.num_heads, self.head_dim
+        q = q.view(B, Nq, H, D).transpose(1, 2)  # (B,H,Nq,D)
+        k = k.view(B, Nk, H, D).transpose(1, 2)  # (B,H,Nk,D)
+        v = v.view(B, Nk, H, D).transpose(1, 2)  # (B,H,Nk,D)
 
-        # Scaled dot-product attention
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D)  # (B, H, Nq, Nk)
+        if self.use_rope:
+            q = self._apply_rope_2d(q, q_positions)
+            k = self._apply_rope_2d(k, kv_positions)
 
+        logits = (q @ k.transpose(-2, -1)) / math.sqrt(D)  # (B,H,Nq,Nk)
         if attn_mask is not None:
-            # attn_mask: (B, Nq, Nk) with 0 or -inf
-            attn_logits = attn_logits + attn_mask.unsqueeze(1)
+            logits = logits + attn_mask.unsqueeze(1)
 
-        attn_weights = torch.softmax(attn_logits, dim=-1)
-        attn_weights = self.dropout(attn_weights)
+        attn = torch.softmax(logits, dim=-1)
+        attn = self.dropout(attn)
 
-        out = torch.matmul(attn_weights, v)  # (B, H, Nq, D)
+        out = attn @ v  # (B,H,Nq,D)
         out = out.transpose(1, 2).contiguous().view(B, Nq, self.d_model)
-        out = self.out_proj(out)
-        return out
+        return self.out_proj(out)
 
 
 class SpatialEncoderLayer(nn.Module):
@@ -354,6 +283,7 @@ class SpatialEncoderLayer(nn.Module):
         ff_mult: int = 4,
         dropout: float = 0.0,
         rope_base_theta: float = 10_000.0,
+        rope_period: float = 1024.0, 
     ) -> None:
         super().__init__()
         self.self_attn = RotaryMultiHeadAttention(
@@ -361,6 +291,7 @@ class SpatialEncoderLayer(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             rope_base_theta=rope_base_theta,
+            rope_period=rope_period,
         )
         self.ff = nn.Sequential(
             nn.Linear(d_model, ff_mult * d_model),
@@ -378,20 +309,22 @@ class SpatialEncoderLayer(nn.Module):
         attn_mask: torch.Tensor,     # (B, N, N)
     ) -> torch.Tensor:
         # Self-attention
-        h = self.self_attn(x, positions, positions, attn_mask)
-        x = self.norm1(x + self.dropout(h))
+        h = self.self_attn(self.norm1(x), positions, positions, attn_mask)
+        x = x + self.dropout(h)
 
         # Feed-forward
-        h = self.ff(x)
-        x = self.norm2(x + self.dropout(h))
+        h = self.ff(self.norm2(x))
+        x = x + self.dropout(h)
         return x
 
 
 class SpatialDecoderLayer(nn.Module):
     """
-    Spatial transformer decoder block with RoPE-based self- and cross-attention.
+    Pre-LN decoder block:
+      x = x + SA(LN(x))
+      x = x + CA(LN(x), memory)
+      x = x + FFN(LN(x))
     """
-
     def __init__(
         self,
         d_model: int,
@@ -399,26 +332,25 @@ class SpatialDecoderLayer(nn.Module):
         ff_mult: int = 4,
         dropout: float = 0.0,
         rope_base_theta: float = 10_000.0,
+        rope_period: float = 1024.0,
+        use_rope: bool = True,
     ) -> None:
         super().__init__()
         self.self_attn = RotaryMultiHeadAttention(
-            d_model=d_model,
-            num_heads=num_heads,
-            dropout=dropout,
-            rope_base_theta=rope_base_theta,
+            d_model=d_model, num_heads=num_heads, dropout=dropout,
+            rope_base_theta=rope_base_theta, rope_period=rope_period,
+            use_rope=use_rope,
         )
         self.cross_attn = RotaryMultiHeadAttention(
-            d_model=d_model,
-            num_heads=num_heads,
-            dropout=dropout,
-            rope_base_theta=rope_base_theta,
+            d_model=d_model, num_heads=num_heads, dropout=dropout,
+            rope_base_theta=rope_base_theta, rope_period=rope_period,
+            use_rope=use_rope,
         )
         self.ff = nn.Sequential(
             nn.Linear(d_model, ff_mult * d_model),
             nn.GELU(),
             nn.Linear(ff_mult * d_model, d_model),
         )
-
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
@@ -426,27 +358,19 @@ class SpatialDecoderLayer(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,               # (B, N, d_model) decoder tokens
-        positions: torch.Tensor,       # (B, N, 2) positions for decoder tokens
-        memory: torch.Tensor,          # (B, N, d_model) encoder outputs
-        memory_positions: torch.Tensor,# (B, N, 2) positions for encoder tokens
-        attn_mask: torch.Tensor,       # (B, N, N)
+        x: torch.Tensor,                 # (B, N, d_model)
+        positions: torch.Tensor,         # (B, N, 2)
+        memory: torch.Tensor,            # (B, N, d_model)
+        memory_positions: torch.Tensor,  # (B, N, 2)
+        attn_mask: torch.Tensor,         # (B, N, N)
     ) -> torch.Tensor:
-        # Self-attention in decoder
-        h = self.self_attn(x, positions, positions, attn_mask)
-        x = self.norm1(x + self.dropout(h))
-
-        # Cross-attention: queries = decoder tokens, keys/values = encoder memory
-        h = self.cross_attn(x, positions, memory_positions, attn_mask, kv=memory)
-        x = self.norm2(x + self.dropout(h))
-
-        # Feed-forward
-        h = self.ff(x)
-        x = self.norm3(x + self.dropout(h))
+        x = x + self.dropout(self.self_attn(self.norm1(x), positions, positions, attn_mask))
+        x = x + self.dropout(self.cross_attn(self.norm2(x), positions, memory_positions, attn_mask, kv=memory))
+        x = x + self.dropout(self.ff(self.norm3(x)))
         return x
 
 
-# Diffusion policy with Encoder-Decoder spatial transformers and RoPE
+
 
 class DiffusionPolicy(nn.Module):
     """
@@ -508,6 +432,7 @@ class DiffusionPolicy(nn.Module):
         ff_mult = diff_cfg.get("HiddenMultiplier", 4)
         self.attn_radius: Optional[float] = diff_cfg.get("AttentionRadius", None)
         rope_base_theta: float = diff_cfg.get("RoPEBaseTheta", 10_000.0)
+        rope_period: float = float(diff_cfg.get("RoPEPeriod", 1024.0))
 
         # Action embedding: 2D actions -> d_model
         self.action_mlp = nn.Sequential(
@@ -532,32 +457,41 @@ class DiffusionPolicy(nn.Module):
             nn.Linear(d_model, d_model),
         )
 
-        # Encoder and decoder stacks
-        self.encoder_layers = nn.ModuleList(
-            [
-                SpatialEncoderLayer(
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    ff_mult=ff_mult,
-                    dropout=dropout,
-                    rope_base_theta=rope_base_theta,
-                )
-                for _ in range(num_enc_layers)
-            ]
-        )
+        # Encoder stack (RoPE only in the first layer)
+        self.encoder_layers = nn.ModuleList([
+            SpatialEncoderLayer(
+                d_model=d_model,
+                num_heads=num_heads,
+                ff_mult=ff_mult,
+                dropout=dropout,
+                rope_base_theta=rope_base_theta,
+                rope_period=rope_period,
+            )
+            for _ in range(num_enc_layers)
+        ])
+        # Decoder stack (RoPE only in the first layer)
+        self.decoder_layers = nn.ModuleList([
+            SpatialDecoderLayer(
+                d_model=d_model,
+                num_heads=num_heads,
+                ff_mult=ff_mult,
+                dropout=dropout,
+                rope_base_theta=rope_base_theta,
+                rope_period=rope_period,
+                use_rope=(i == 0),
+            )
+            for i in range(num_dec_layers)
+        ])
 
-        self.decoder_layers = nn.ModuleList(
-            [
-                SpatialDecoderLayer(
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    ff_mult=ff_mult,
-                    dropout=dropout,
-                    rope_base_theta=rope_base_theta,
-                )
-                for _ in range(num_dec_layers)
-            ]
-        )
+
+
+        for i in range(1, len(self.encoder_layers)):
+            self.encoder_layers[i].self_attn.use_rope = False
+
+        for i in range(1, len(self.decoder_layers)):
+            self.decoder_layers[i].self_attn.use_rope = False
+            self.decoder_layers[i].cross_attn.use_rope = False
+
 
         # Final head to predict noise on actions
         self.noise_head = nn.Sequential(
@@ -573,36 +507,23 @@ class DiffusionPolicy(nn.Module):
 
 
     def _sinusoidal_time_embedding(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        Create a standard sinusoidal embedding for scalar timesteps.
-
-        Args:
-            t: (B,) or (B, 1) integer timesteps in [0, T-1]
-
-        Returns:
-            (B, time_dim) tensor
-        """
         if t.dim() == 2:
             t = t.squeeze(-1)
         t = t.float()
         device = t.device
 
         half_dim = self.time_dim // 2
-        # Exponential frequencies as in standard transformer embeddings
+        denom = max(half_dim - 1, 1)
         freqs = torch.exp(
-            torch.linspace(
-                math.log(1.0),
-                math.log(10_000.0),
-                steps=half_dim,
-                device=device,
-            )
-            * (-1.0 / (half_dim - 1))
-        )
-        args = t.unsqueeze(-1) * freqs.unsqueeze(0)  # (B, half_dim)
-        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+            -math.log(10000.0) * torch.arange(half_dim, device=device, dtype=torch.float32) / denom
+        )  # (half_dim,)
+
+        args = t[:, None] * freqs[None, :]  # (B, half_dim)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (B, 2*half_dim)
         if self.time_dim % 2 == 1:
             emb = F.pad(emb, (0, 1))
         return emb
+
 
     # ------------------------------------------------------------------
     # Graph-aware attention mask
@@ -695,7 +616,6 @@ class DiffusionPolicy(nn.Module):
         self,
         coverage_maps: torch.Tensor,      # (B, N, C, H, W)
         positions: torch.Tensor,          # (B, N, 2)
-        t: torch.Tensor,                  # (B,)
         edge_weights: Optional[torch.Tensor],  # (B, N, N) or None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -716,12 +636,7 @@ class DiffusionPolicy(nn.Module):
         # Position embedding (absolute MLP; RoPE handles relative geometry)
         p_emb = self.pos_mlp(positions)               # (B, N, d_model)
 
-        # Time embedding shared across robots in the same graph
-        t_emb = self._sinusoidal_time_embedding(t)    # (B, time_dim)
-        t_emb = self.time_mlp(t_emb)                  # (B, d_model)
-        t_emb = t_emb.unsqueeze(1).expand(-1, N, -1)  # (B, N, d_model)
-
-        obs_tokens = cnn_feat + p_emb + t_emb         # (B, N, d_model)
+        obs_tokens = cnn_feat + p_emb
 
         # Graph-aware attention mask
         attn_mask = self._build_attention_mask(positions, edge_weights)  # (B, N, N)
@@ -788,7 +703,6 @@ class DiffusionPolicy(nn.Module):
         memory, attn_mask = self._encode_observations(
             coverage_maps=coverage_maps,
             positions=positions,
-            t=t,
             edge_weights=edge_weights,
         )
         eps_hat = self._decode_actions(
@@ -821,32 +735,27 @@ class DiffusionPolicy(nn.Module):
         device = coverage_maps.device
         B, N, C, H, W = coverage_maps.shape
 
-        # 选择时间子序列 t_T,...,t_0
-        timesteps = diffusion.get_sampling_timesteps(
-            num_sampling_steps=num_steps,
-            device=device,
+        memory, attn_mask = self._encode_observations(
+            coverage_maps=coverage_maps,
+            positions=positions,
+            edge_weights=edge_weights,
         )
 
-        # 从标准高斯噪声开始
+        timesteps = diffusion.get_sampling_timesteps(num_steps, device=device)
         x_t = torch.randn(B, N, 2, device=device)
 
-        for t_scalar in timesteps:
-            t_batch = torch.full((B,), int(t_scalar), device=device, dtype=torch.long)
+        for t_scalar, t_prev_scalar in zip(timesteps[:-1], timesteps[1:]):
+            t_batch      = torch.full((B,), int(t_scalar),      device=device, dtype=torch.long)
+            t_prev_batch = torch.full((B,), int(t_prev_scalar), device=device, dtype=torch.long)
 
-            eps_hat = self(
-                coverage_maps=coverage_maps,
+            eps_hat = self._decode_actions(
                 actions_t=x_t,
-                t=t_batch,
                 positions=positions,
-                edge_weights=edge_weights,
-            )  # (B, N, 2)
-
-            x_t = diffusion.ddim_step(
-                x_t=x_t,
                 t=t_batch,
-                eps_hat=eps_hat,
-                eta=eta,
+                memory=memory,
+                memory_positions=positions,
+                attn_mask=attn_mask,
             )
+            x_t = diffusion.ddim_step(x_t=x_t, t=t_batch, t_prev=t_prev_batch, eps_hat=eps_hat, eta=eta)
 
-        # u_0 的估计
         return x_t
