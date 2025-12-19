@@ -502,8 +502,8 @@ class DiffusionPolicy(nn.Module):
         )
 
         # Buffers for action normalization (set in training script)
-        self.register_buffer("actions_mean", torch.zeros(1, 1, 2), persistent=False)
-        self.register_buffer("actions_std", torch.ones(1, 1, 2), persistent=False)
+        self.register_buffer("actions_mean", torch.zeros(1, 1, 2), persistent=True)
+        self.register_buffer("actions_std",  torch.ones(1, 1, 2), persistent=True)
 
 
     def _sinusoidal_time_embedding(self, t: torch.Tensor) -> torch.Tensor:

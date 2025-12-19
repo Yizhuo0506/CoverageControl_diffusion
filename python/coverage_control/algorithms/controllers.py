@@ -23,7 +23,7 @@
 import coverage_control.nn as cc_nn
 import torch
 torch.set_float32_matmul_precision('high')
-
+import pathlib
 from . import CentralizedCVT
 from . import ClairvoyantCVT
 from . import DecentralizedCVT
@@ -157,8 +157,8 @@ class ControllerNN:
                 am = raw_state_dict.pop("actions_mean", None)
                 as_ = raw_state_dict.pop("actions_std", None)
                 if am is not None and as_ is not None:
-                    self.actions_mean = am.to(self.device)
-                    self.actions_std = as_.to(self.device)
+                    self.actions_mean = am.to(self.device).float().view(-1)  # (2,)
+                    self.actions_std  = as_.to(self.device).float().view(-1) # (2,)
 
                 # 3) Build DiffusionPolicy model from learning_params
                 self.model = DiffusionPolicy(self.learning_params).to(self.device)
@@ -196,6 +196,31 @@ class ControllerNN:
 
             else:
                 raise ValueError(f"[ControllerNN] Unknown PolicyType: {self.policy_type}")
+            
+            # --- Fallback: load action normalization stats from dataset directory (DIFFUSION only) ---
+            if self.policy_type == "DIFFUSION" and hasattr(self, "learning_params"):
+                if self.actions_mean is None or self.actions_std is None:
+                    dataset_root = pathlib.Path(IOUtils.sanitize_path(self.learning_params["DataDir"]))
+                    data_dir = (dataset_root / "data") if (dataset_root / "data").exists() else dataset_root
+
+                    mean_path = data_dir / "actions_mean.pt"
+                    std_path  = data_dir / "actions_std.pt"
+
+                    if mean_path.exists() and std_path.exists():
+                        am = torch.load(mean_path, map_location="cpu").float().view(-1)  # (2,)
+                        as_ = torch.load(std_path, map_location="cpu").float().view(-1)  # (2,)
+                        self.actions_mean = am.to(self.device)
+                        self.actions_std  = as_.to(self.device)
+
+                        # Optional: also copy into model buffers (1,1,2) for internal use
+                        with torch.no_grad():
+                            if hasattr(self.model, "actions_mean"):
+                                self.model.actions_mean.copy_(self.actions_mean.view(1, 1, 2))
+                            if hasattr(self.model, "actions_std"):
+                                self.model.actions_std.copy_(self.actions_std.view(1, 1, 2))
+                    else:
+                        print(f"[DiffusionPolicy][WARN] actions_mean/std not found under {data_dir}. "
+                            "Diffusion actions will NOT be denormalized.")
 
         # 模型统一放到 device 上并编译
         self.model = self.model.to(self.device)
