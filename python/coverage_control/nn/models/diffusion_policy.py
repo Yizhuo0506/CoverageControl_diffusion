@@ -110,31 +110,43 @@ class GaussianDiffusion(nn.Module):
 
 
     # ---- time subsequence for fast DDIM sampling ----
-    def get_sampling_timesteps(
-        self,
-        num_sampling_steps: int | None,
-        device: torch.device | None = None,
-    ) -> torch.Tensor:
+    def get_sampling_timesteps(self, num_sampling_steps: int | None, device=None) -> torch.Tensor:
         """
-        Generate a decreasing sequence of timesteps t_T, ..., t_0 for DDIM.
+        Return a strictly decreasing integer timestep schedule.
 
-        - If num_sampling_steps is None or >= num_steps, use all steps T-1,...,0.
-        - Otherwise, pick an evenly spaced subsequence.
+        Semantics:
+        - num_sampling_steps = S means we will perform exactly S denoising transitions.
+        - Therefore we return (S + 1) indices including both endpoints (T-1 and 0).
         """
         if device is None:
             device = self.betas.device
 
-        T = self.num_steps
+        T = int(self.num_steps)
 
-        if (num_sampling_steps is None) or (num_sampling_steps >= T):
+        # Full chain: transitions = (T-1), indices = T
+        if (num_sampling_steps is None) or (int(num_sampling_steps) >= (T - 1)):
             return torch.arange(T - 1, -1, -1, device=device, dtype=torch.long)
 
-        # 等间隔子序列（包含 0 和 T-1）
-        step = (T - 1) / float(num_sampling_steps - 1)
-        idx = torch.round(torch.arange(0, T, step, device=device)).long()
-        # 从大到小（T-1 ... 0）
-        idx, _ = torch.sort(idx, descending=True)
-        return idx
+        S = int(num_sampling_steps)
+        n_idx = S + 1  # indices count so that transitions count is exactly S
+
+        # Start with a float linspace, then round to integer indices.
+        ts = torch.linspace(T - 1, 0, steps=n_idx, device=device).round().long()
+        ts = ts.clamp(0, T - 1)
+
+        # Force endpoints exactly.
+        ts[0] = T - 1
+        ts[-1] = 0
+
+        # Enforce strictly decreasing to prevent t_prev == t "no-op" steps.
+        # (Loop is tiny: <= 51 when S=50)
+        for i in range(1, ts.numel()):
+            prev = int(ts[i - 1].item())
+            cur = int(ts[i].item())
+            if cur >= prev:
+                ts[i] = max(prev - 1, 0)
+
+        return ts
 
     # ---- checkpoint I/O ----
     def to_state_dict(self) -> Dict[str, torch.Tensor]:
