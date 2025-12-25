@@ -7,6 +7,8 @@ NumWorkers = 4
 # Similarly, for the optimizer
 [LPACModel]
 Dir = "${CoverageControl_ws}/lpac/models/"
+Model = "model.pt"
+Optimizer = "optimizer.pt"
 
 [CNNModel]
 Dir = "${CoverageControl_ws}/lpac/models/" # Absolute location
@@ -26,8 +28,8 @@ OutputDim = 2
 [LPACTraining]
 LearningRate = 0.0001
 WeightDecay = 0.001
-BatchSize = 10
-NumEpochs = 15
+BatchSize = 192
+NumEpochs = 100
 
 [CNNBackBone]
 InputDim = 4
@@ -46,17 +48,28 @@ Momentum = 0.1
 
 [DiffusionModel]
 Dir = "${CoverageControl_ws}/lpac/models/diffusion"
-DModel           = 128      # token hidden dim
-NumHeads         = 4
-NumLayers        = 4
-HiddenMultiplier = 4       
+DModel           = 256      # token hidden dim
+NumHeads         = 8
+NumEncoderLayers = 8
+NumDecoderLayers = 8  
+HiddenMultiplier = 4  
 Dropout          = 0.0
-AttentionRadius  = 0.3      
-TimeEmbeddingDim = 128
+AttentionRadius  = 256      
+TimeEmbeddingDim = 256 
+RoPEBaseTheta    = 10000.0
+RoPEPeriod = 1024.0
 
 [DiffusionTraining]
-BatchSize         = 64
-NumEpochs         = 20
-LearningRate      = 1e-4
-WeightDecay       = 1e-6
+BatchSize         = 196
+NumEpochs         = 1000
+LearningRate      = 8.5e-5
+WeightDecay       = 2.1e-12
 NumDiffusionSteps = 1000
+BetaStart = 1e-4
+BetaEnd   = 2e-2
+
+[DiffusionSampling]
+NumSamplingSteps = 50
+Eta = 0.0
+
+
