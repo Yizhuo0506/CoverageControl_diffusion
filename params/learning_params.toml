@@ -67,9 +67,14 @@ WeightDecay       = 2.1e-12
 NumDiffusionSteps = 1000
 BetaStart = 1e-4
 BetaEnd   = 2e-2
+ValPatience       = 500
+ValMinDelta       = 1e-4
 
 [DiffusionSampling]
 NumSamplingSteps = 50
 Eta = 0.0
+CommInterval      = 1      # 每 1 个控制步广播一次 token
+TokenTTL          = 0      # token 不允许过期
+CommRadius        = 256
 
 
