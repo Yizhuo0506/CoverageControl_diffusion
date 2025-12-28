@@ -22,6 +22,47 @@
 #  @brief Base classes for CVT and neural network based controllers
 import coverage_control.nn as cc_nn
 import torch
+
+class TokenBuffer:
+    """Token cache for decentralized execution.
+
+    each robot shares perceptual token z_i with peers in
+    communication range; receivers cache the latest embeddings.
+    """
+
+    def __init__(self, num_robots: int, device: torch.device, max_age_steps: int = 0):
+        self.num_robots = int(num_robots)
+        self.device = device
+        self.max_age_steps = int(max_age_steps)
+
+        self._z = [None] * self.num_robots
+        self._x = [None] * self.num_robots
+        self._t = [-1] * self.num_robots
+
+    def write(self, robot_id: int, z: torch.Tensor, x: torch.Tensor, step: int) -> None:
+        rid = int(robot_id)
+        self._z[rid] = z.detach()
+        self._x[rid] = x.detach()
+        self._t[rid] = int(step)
+
+    def write_all(self, z_all: torch.Tensor, x_all: torch.Tensor, step: int) -> None:
+        for rid in range(self.num_robots):
+            self.write(rid, z_all[rid], x_all[rid], step)
+
+    def is_fresh(self, robot_id: int, step: int) -> bool:
+        last = self._t[int(robot_id)]
+        if last < 0:
+            return False
+        if self.max_age_steps <= 0:
+            return last == int(step)
+        return last >= int(step) - self.max_age_steps
+
+    def get_z(self, robot_id: int) -> torch.Tensor:
+        return self._z[int(robot_id)]
+
+    def get_x(self, robot_id: int) -> torch.Tensor:
+        return self._x[int(robot_id)]
+
 torch.set_float32_matmul_precision('high')
 import pathlib
 from . import CentralizedCVT
@@ -108,7 +149,7 @@ class ControllerNN:
         self.config = config
         self.params = params
         self.name = self.config["Name"]
-        # PolicyType: "LPAC" 或 "DIFFUSION"
+        # PolicyType: "LPAC" / "DIFFUSION"
         self.policy_type = str(self.config.get("PolicyType", "LPAC")).upper()
 
         self.use_cnn = self.config["UseCNN"]
@@ -117,25 +158,21 @@ class ControllerNN:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # 归一化统计量
+        
         self.actions_mean: torch.Tensor | None = None
         self.actions_std: torch.Tensor | None = None
 
-        # 扩散调度结构，只在 DIFFUSION 模式下用
         self.diffusion: dict | None = None
 
         if "ModelFile" in self.config:
             self.model_file = IOUtils.sanitize_path(self.config["ModelFile"])
-            # 作者这里用的是 torch.load（而不是 torch.jit.load），我们保持行为一致
             self.model = torch.load(self.model_file, map_location=self.device)
         else:
-            # 用 LearningParams + ModelStateDict 的方式加载
             self.learning_params_file = IOUtils.sanitize_path(self.config["LearningParams"])
             self.learning_params = IOUtils.load_toml(self.learning_params_file)
 
             if self.policy_type == "LPAC":
                 self.model = cc_nn.LPAC(self.learning_params).to(self.device)
-                # LPAC 内部的 load_model 会自己处理 state_dict 和 actions_mean/std
                 self.model.load_model(IOUtils.sanitize_path(self.config["ModelStateDict"]))
                 self.actions_mean = self.model.actions_mean.to(self.device)
                 self.actions_std = self.model.actions_std.to(self.device)
@@ -174,12 +211,10 @@ class ControllerNN:
                     diff_state = ckpt["diffusion"]
 
                 if diff_state is not None:
-                    # Use exactly the same schedule as in training
                     self.diffusion = GaussianDiffusion.from_state_dict(
                         diff_state, device=self.device
                     )
                 else:
-                    # Fallback: build a fresh schedule from DiffusionTraining config
                     diff_train_cfg = self.learning_params.get("DiffusionTraining", {})
                     num_steps = int(diff_train_cfg.get("NumDiffusionSteps", 1000))
                     beta_start = float(diff_train_cfg.get("BetaStart", 1e-4))
@@ -194,10 +229,19 @@ class ControllerNN:
                 # 5) Store sampling configuration (DDIM steps / eta)
                 self.sampling_cfg = self.learning_params.get("DiffusionSampling", {})
 
+                # 6) Paper-aligned decentralized execution parameters
+                #    - communication range is matched to the attention radius (default 256 m)
+                #    - CommInterval=1 and TokenTTL=0 correspond to ideal wireless (no delay/loss)
+                self._step = 0
+                self.comm_interval = int(self.sampling_cfg.get("CommInterval", 1))
+                self.token_ttl = int(self.sampling_cfg.get("TokenTTL", 0))
+                self.comm_radius = float(self.sampling_cfg.get("CommRadius", getattr(self.model, "attn_radius", 256.0) or 256.0))
+                self._token_buffer = None
+
             else:
                 raise ValueError(f"[ControllerNN] Unknown PolicyType: {self.policy_type}")
             
-            # --- Fallback: load action normalization stats from dataset directory (DIFFUSION only) ---
+            # --- load action normalization stats from dataset directory (delete if re-train) ---
             if self.policy_type == "DIFFUSION" and hasattr(self, "learning_params"):
                 if self.actions_mean is None or self.actions_std is None:
                     dataset_root = pathlib.Path(IOUtils.sanitize_path(self.learning_params["DataDir"]))
@@ -212,7 +256,6 @@ class ControllerNN:
                         self.actions_mean = am.to(self.device)
                         self.actions_std  = as_.to(self.device)
 
-                        # Optional: also copy into model buffers (1,1,2) for internal use
                         with torch.no_grad():
                             if hasattr(self.model, "actions_mean"):
                                 self.model.actions_mean.copy_(self.actions_mean.view(1, 1, 2))
@@ -222,7 +265,7 @@ class ControllerNN:
                         print(f"[DiffusionPolicy][WARN] actions_mean/std not found under {data_dir}. "
                             "Diffusion actions will NOT be denormalized.")
 
-        # 模型统一放到 device 上并编译
+        
         self.model = self.model.to(self.device)
         self.model.eval()
         self.model = torch.compile(self.model, dynamic=True)
@@ -244,7 +287,6 @@ class ControllerNN:
             A tuple (objective_value, converged_flag).
         """
         if self.policy_type == "LPAC":
-            # Original LPAC path: construct torch_geometric data and run LPAC model.
             pyg_data = CoverageEnvUtils.get_torch_geometric_data(
                 env,
                 self.params,
@@ -280,47 +322,43 @@ class ControllerNN:
         return objective_value, converged
 
     def _diffusion_step(self, env: CoverageSystem) -> torch.Tensor:
-        """
-        Run a full reverse diffusion chain for the current environment state
-        and return the denoised actions a_0.
+        """Decentralized MADP execution.
 
-        Returns:
-            actions_0: Tensor of shape (num_robots, 2).
+        - Each robot computes its local perceptual token z_i = CNN(o_i).
+        - Robots exchange only z_i within communication range (token buffer).
+        - The encoder Ψ_E runs once per sampling call; DDIM denoises for S steps.
         """
         assert self.diffusion is not None, "[ControllerNN] Diffusion schedule not initialized."
 
+        diffusion = self.diffusion
+        if isinstance(diffusion, dict):
+            diffusion = GaussianDiffusion.from_state_dict(diffusion, device=self.device)
+            self.diffusion = diffusion
+
         num_robots = env.GetNumRobots()
 
-        # === 1. Build local and obstacle maps exactly as in DataGenerator / DiffusionDataset ===
-        # raw_local_maps: (N, H_raw, W_raw)
+        # Lazy init token buffer once we know N.
+        if self._token_buffer is None or self._token_buffer.num_robots != num_robots:
+            self._token_buffer = TokenBuffer(num_robots=num_robots, device=self.device, max_age_steps=self.token_ttl)
+
+        # === 1) Build local/obstacle maps  ===
         raw_local_maps = CoverageEnvUtils.get_raw_local_maps(env, self.params)
         raw_obstacle_maps = CoverageEnvUtils.get_raw_obstacle_maps(env, self.params)
 
-        # Add a batch dimension so that resize_maps behaves exactly as in data_generation.py:
-        # input: (B, N, H_raw, W_raw) -> output: (B * N, CNNMapSize, CNNMapSize)
-        raw_local_maps = raw_local_maps.unsqueeze(0)      # (1, N, H_raw, W_raw)
-        raw_obstacle_maps = raw_obstacle_maps.unsqueeze(0)  # (1, N, H_raw, W_raw)
+        # (B=1, N, H_raw, W_raw) -> (B*N, H, W)
+        raw_local_maps = raw_local_maps.unsqueeze(0)
+        raw_obstacle_maps = raw_obstacle_maps.unsqueeze(0)
 
-        resized_local = CoverageEnvUtils.resize_maps(
-            raw_local_maps, self.cnn_map_size
-        )  # (1 * N, H, W)
-        resized_obstacle = CoverageEnvUtils.resize_maps(
-            raw_obstacle_maps, self.cnn_map_size
-        )  # (1 * N, H, W)
+        resized_local = CoverageEnvUtils.resize_maps(raw_local_maps, self.cnn_map_size)
+        resized_obstacle = CoverageEnvUtils.resize_maps(raw_obstacle_maps, self.cnn_map_size)
 
-        # Reshape back to (B=1, N, H, W) and take the single batch.
-        resized_local = resized_local.view(
-            1, num_robots, self.cnn_map_size, self.cnn_map_size
-        )
-        resized_obstacle = resized_obstacle.view(
-            1, num_robots, self.cnn_map_size, self.cnn_map_size
-        )
+        resized_local = resized_local.view(1, num_robots, self.cnn_map_size, self.cnn_map_size)
+        resized_obstacle = resized_obstacle.view(1, num_robots, self.cnn_map_size, self.cnn_map_size)
 
-        local_maps = resized_local[0]         # (N, H, W)
-        obstacle_maps = resized_obstacle[0]   # (N, H, W)
+        local_maps = resized_local[0]       # (N, H, W)
+        obstacle_maps = resized_obstacle[0] # (N, H, W)
 
-        # === 2. Build coverage_maps channels, consistent with DiffusionDataset ===
-        # In DiffusionDataset: UseCommMaps = True -> C = 4, else C = 2.
+        # === 2) Build coverage_maps channels (consistent with DiffusionDataset) ===
         C = 4 if self.use_comm_map else 2
         coverage_maps = torch.zeros(
             (1, num_robots, C, self.cnn_map_size, self.cnn_map_size),
@@ -331,50 +369,45 @@ class ControllerNN:
         coverage_maps[0, :, 1] = obstacle_maps.to(self.device)
 
         if self.use_comm_map:
-            # get_communication_maps returns (N, 2, H, W) already at the desired CNNMapSize.
-            comm_maps = CoverageEnvUtils.get_communication_maps(
-                env, self.params, self.cnn_map_size
-            )  # (N, 2, H, W)
+            comm_maps = CoverageEnvUtils.get_communication_maps(env, self.params, self.cnn_map_size)  # (N, 2, H, W)
             coverage_maps[0, :, 2:4] = comm_maps.to(self.device)
 
-        # === 3. Robot positions and edge weights (communication graph) ===
-        # DataGenerator uses: CoverageEnvUtils.get_robot_positions(self.env)
-        positions = CoverageEnvUtils.get_robot_positions(env)  # (N, 2)
-        positions = positions.unsqueeze(0).to(self.device)     # (1, N, 2)
+        # === 3) Robot positions ===
+        positions = CoverageEnvUtils.get_robot_positions(env).unsqueeze(0).to(self.device)  # (1, N, 2)
 
-        # communication weights used for graph-component attention mask
-        edge_weights = None
-        if hasattr(CoverageEnvUtils, "get_weights"):
-            w = CoverageEnvUtils.get_weights(env, self.params)  # (N, N)
-            if isinstance(w, torch.Tensor):
-                edge_weights = w.unsqueeze(0).to(self.device)
+        # === 4) Local token computation and (ideal) token exchange ===
+        z_all = self.model.perceptual_tokens(coverage_maps)  # (1, N, D)
 
-        # === 4. Run reverse diffusion using the GaussianDiffusion object and DDIM updates ===
-        diffusion = self.diffusion
-        # Backward compatibility: if diffusion was stored as a raw dict, rebuild the object.
-        if isinstance(diffusion, dict):
-            diffusion = GaussianDiffusion.from_state_dict(diffusion, device=self.device)
-            self.diffusion = diffusion
+        if (self._step % self.comm_interval) == 0:
+            self._token_buffer.write_all(z_all[0], positions[0], step=self._step)
 
-        # Sampling configuration: number of reverse steps and DDIM eta.
+       # === 5) One-shot sampling for all robots (token-only, mask enforces locality) ===
         num_sampling_steps = self.sampling_cfg.get("NumSamplingSteps", None)
         eta = float(self.sampling_cfg.get("Eta", 0.0))
+        r = float(self.comm_radius)
 
-        # DiffusionPolicy.sample_actions internally calls diffusion.ddim_step(...)
-        actions = self.model.sample_actions(
-            coverage_maps=coverage_maps,
-            positions=positions,
+        pos = positions[0]  # (N, 2)
+        dx = pos[:, None, :] - pos[None, :, :]
+        dist2 = (dx * dx).sum(dim=-1)                 # (N, N)
+        edge_weights = (dist2 <= (r * r)).float()     # (N, N)
+        edge_weights = edge_weights.unsqueeze(0)      # (1, N, N)
+
+        # only tokens are used as conditioning (no raw map leakage beyond CNN->z)
+        u_all = self.model.sample_actions_from_tokens(
+            z=z_all,                      # (1, N, D)
+            positions=positions,           # (1, N, 2)
             diffusion=diffusion,
-            edge_weights=edge_weights,
+            edge_weights=edge_weights,     # (1, N, N)  attention mask inside model
             num_steps=num_sampling_steps,
             eta=eta,
-        )  # (1, N, 2)
+        )  # (1, N, 2) normalized
 
-        actions = actions[0]  # (N, 2)
+        actions = u_all[0]  # (N, 2)
 
-        # === 5. De-normalize if action statistics are available ===
+        self._step += 1
+
+        # === 6) De-normalize if action statistics are available ===
         if self.actions_mean is not None and self.actions_std is not None:
             actions = actions * self.actions_std + self.actions_mean
 
         return actions
-

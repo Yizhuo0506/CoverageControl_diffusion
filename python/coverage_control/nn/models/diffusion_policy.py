@@ -61,7 +61,6 @@ class GaussianDiffusion(nn.Module):
             torch.sqrt(1.0 - alphas_cumprod),
         )
 
-    # ---- helpers ----
     def _extract(self, buf: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tensor:
         """
         从长度为 T 的 buffer 中按 batch t (B,) 取出对应值，并 reshape 成 (B, 1, 1, ...)
@@ -69,7 +68,7 @@ class GaussianDiffusion(nn.Module):
         out = buf.gather(0, t)
         return out.view(-1, *([1] * (len(x_shape) - 1)))
 
-    # ---- forward diffusion q(u_t | u_0) ----
+    # forward diffusion q(u_t | u_0) 
     def q_sample(
         self,
         actions_0: torch.Tensor,           # (B, N, 2)
@@ -89,7 +88,7 @@ class GaussianDiffusion(nn.Module):
 
         return sqrt_alpha_bar_t * actions_0 + sqrt_one_minus_alpha_bar_t * noise
 
-    # ---- reverse DDIM step u_t -> u_{t-1} ----
+    # reverse DDIM step u_t -> u_{t-1} 
     @torch.no_grad()
     def ddim_step(self, x_t, t, t_prev, eps_hat, eta: float = 0.0):
         alpha_bar_t    = self._extract(self.alphas_cumprod, t, x_t.shape)
@@ -109,7 +108,7 @@ class GaussianDiffusion(nn.Module):
         return torch.sqrt(alpha_bar_prev) * x0_pred + dir_xt + sigma_t * noise
 
 
-    # ---- time subsequence for fast DDIM sampling ----
+    # time subsequence for fast DDIM sampling 
     def get_sampling_timesteps(self, num_sampling_steps: int | None, device=None) -> torch.Tensor:
         """
         Return a strictly decreasing integer timestep schedule.
@@ -148,7 +147,7 @@ class GaussianDiffusion(nn.Module):
 
         return ts
 
-    # ---- checkpoint I/O ----
+    # checkpoint I/O 
     def to_state_dict(self) -> Dict[str, torch.Tensor]:
         return {
             "num_steps": torch.tensor(self.num_steps, dtype=torch.int64),
@@ -537,9 +536,7 @@ class DiffusionPolicy(nn.Module):
         return emb
 
 
-    # ------------------------------------------------------------------
     # Graph-aware attention mask
-    # ------------------------------------------------------------------
     def _compute_component_ids(self, edge_weights: torch.Tensor) -> torch.Tensor:
         """
         Compute connected-component IDs for each robot using the communication graph.
@@ -621,44 +618,68 @@ class DiffusionPolicy(nn.Module):
         return attn_mask
 
 
-    # ------------------------------------------------------------------
     # Encoder / Decoder forward passes
-    # ------------------------------------------------------------------
-    def _encode_observations(
-        self,
-        coverage_maps: torch.Tensor,      # (B, N, C, H, W)
-        positions: torch.Tensor,          # (B, N, 2)
-        edge_weights: Optional[torch.Tensor],  # (B, N, N) or None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Encode observations into a set of memory tokens.
+    def _perceptual_tokens(self, coverage_maps: torch.Tensor) -> torch.Tensor:
+        """Compute per-robot perceptual tokens z_i from local maps only.
+
+        Args:
+            coverage_maps: (B, N, C, H, W)
 
         Returns:
-            memory:    (B, N, d_model)
-            attn_mask: (B, N, N) attention mask over robot tokens
+            z: (B, N, D) where D=self.d_model
         """
         B, N, C, H, W = coverage_maps.shape
+        x = coverage_maps.view(B * N, C, H, W)               # (B*N, C, H, W)
+        z = self.cnn_backbone(x)                             # (B*N, D)
+        z = self.cnn_proj(z)                                 # (B*N, D)
+        z = z.view(B, N, self.d_model)                       # (B, N, D)
+        return z
 
-        # CNN backbone runs per robot
-        x = coverage_maps.view(B * N, C, H, W)
-        cnn_feat = self.cnn_backbone(x)               # (B*N, cnn_latent)
-        cnn_feat = self.cnn_proj(cnn_feat)            # (B*N, d_model)
-        cnn_feat = cnn_feat.view(B, N, self.d_model)  # (B, N, d_model)
+    def encode_tokens(
+        self,
+        z: torch.Tensor,
+        positions: torch.Tensor,
+        edge_weights: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Run the encoder once given perceptual tokens and positions.
 
-        # Position embedding (absolute MLP; RoPE handles relative geometry)
-        p_emb = self.pos_mlp(positions)               # (B, N, d_model)
+        This matches Algorithm 1 semantics: CNN(O) produces z_i;
+        z_i are shared; the encoder Ψ_E runs once per sampling call.
 
-        obs_tokens = cnn_feat + p_emb
+        Args:
+            z: (B, N, D) perceptual tokens
+            positions: (B, N, 2) positions in meters
+            edge_weights: (B, N, N) optional adjacency/weights for component masking
 
-        # Graph-aware attention mask
-        attn_mask = self._build_attention_mask(positions, edge_weights)  # (B, N, N)
+        Returns:
+            memory: (B, N, D) encoded tokens
+            attn_mask: (B, N, N) boolean mask (True=allowed) or None
+        """
+        pos_emb = self.pos_mlp(positions)                    # (B, N, D)
+        tokens = z + pos_emb                                 # (B, N, D)
 
-        # Pass through encoder layers
-        h = obs_tokens
+        attn_mask = self._build_attention_mask(positions, edge_weights)  # (B, N, N) or None
+
+        h = tokens
         for layer in self.encoder_layers:
-            h = layer(h, positions, attn_mask)
+            h = layer(h, positions=positions, attn_mask=attn_mask)
+        return h, attn_mask
 
-        memory = h  # (B, N, d_model)
+    def _encode_observations(
+        self,
+        coverage_maps: torch.Tensor,
+        positions: torch.Tensor,
+        edge_weights: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Encode observations into a per-robot memory tensor.
+
+        This function exists for training-time usage where the raw maps are available.
+        For decentralized execution, use:
+            - perceptual_tokens(coverage_maps) to compute z_i locally
+            - sample_actions_from_tokens(...) to sample with token buffers
+        """
+        z = self._perceptual_tokens(coverage_maps)  # (B, N, D)
+        memory, attn_mask = self.encode_tokens(z, positions, edge_weights=edge_weights)
         return memory, attn_mask
 
     def _decode_actions(
@@ -727,47 +748,94 @@ class DiffusionPolicy(nn.Module):
         )
         return eps_hat
 
+    
+    def perceptual_tokens(self, coverage_maps: torch.Tensor) -> torch.Tensor:
+        """Public wrapper for perceptual tokens z_i."""
+        return self._perceptual_tokens(coverage_maps)
+
+    @torch.no_grad()
+    def sample_actions_from_tokens(
+        self,
+        z: torch.Tensor,                     # (B, N, D)
+        positions: torch.Tensor,             # (B, N, 2)
+        diffusion: GaussianDiffusion,
+        edge_weights: Optional[torch.Tensor] = None,
+        num_steps: Optional[int] = None,
+        eta: float = 0.0,
+        init_noise: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Sample actions using perceptual tokens.
+
+        This corresponds to Algorithm 1:
+        - each robot computes and shares its perceptual token z_i
+        - the encoder runs once per sampling call to produce conditioning
+        - DDIM denoises for S steps to produce actions
+
+        Args:
+            z: perceptual tokens (B, N, D)
+            positions: robot positions (B, N, 2)
+            diffusion: GaussianDiffusion instance (defines β schedule and DDIM update)
+            edge_weights: optional adjacency (B, N, N) for component masking
+            num_steps: DDIM sampling steps S (e.g., 50). If None, use full chain.
+            eta: DDIM stochasticity parameter η ∈ [0, 1]
+            init_noise: optional initial noise in action space (B, N, 2)
+
+        Returns:
+            actions: (B, N, 2) sampled actions in normalized units.
+        """
+        B, N, _ = positions.shape
+        device = positions.device
+
+        # 1) Encoder runs once per sampling call
+        memory, attn_mask = self.encode_tokens(z=z, positions=positions, edge_weights=edge_weights)
+
+        # 2) Initialize actions with Gaussian noise (u_T ~ N(0, I))
+        if init_noise is None:
+            actions_t = torch.randn((B, N, 2), device=device, dtype=positions.dtype)
+        else:
+            actions_t = init_noise.to(device=device, dtype=positions.dtype)
+
+        # 3) DDIM denoising schedule
+        ts = diffusion.get_sampling_timesteps(num_sampling_steps=num_steps, device=device)  # (S+1,) descending
+        if ts.numel() < 2:
+            return actions_t
+
+        # 4) Denoise: u_t -> u_{t-1}
+        for k in range(int(ts.numel()) - 1):
+            t_val = int(ts[k].item())
+            t_prev_val = int(ts[k + 1].item())
+
+            t = torch.full((B,), t_val, device=device, dtype=torch.long)
+            t_prev = torch.full((B,), t_prev_val, device=device, dtype=torch.long)
+
+            eps_hat = self._decode_actions(
+                actions_t=actions_t,
+                positions=positions,
+                t=t,
+                memory=memory,
+                memory_positions=positions,
+                attn_mask=attn_mask,
+            )
+            actions_t = diffusion.ddim_step(actions_t, t, t_prev, eps_hat, eta=float(eta))
+
+        return actions_t
+
     @torch.no_grad()
     def sample_actions(
         self,
         coverage_maps: torch.Tensor,         # (B, N, C, H, W)
         positions: torch.Tensor,             # (B, N, 2)
         diffusion: GaussianDiffusion,
-        edge_weights: torch.Tensor | None = None,
-        num_steps: int | None = None,
+        edge_weights: Optional[torch.Tensor] = None,
+        num_steps: Optional[int] = None,
         eta: float = 0.0,
     ) -> torch.Tensor:
-        """
-        Run the DDIM reverse process to sample actions u_0 from pure noise.
-
-        Returns:
-            actions_0: (B, N, 2), still in *normalized* action space.
-        """
-        self.eval()
-        device = coverage_maps.device
-        B, N, C, H, W = coverage_maps.shape
-
-        memory, attn_mask = self._encode_observations(
-            coverage_maps=coverage_maps,
+        z = self._perceptual_tokens(coverage_maps)
+        return self.sample_actions_from_tokens(
+            z=z,
             positions=positions,
+            diffusion=diffusion,
             edge_weights=edge_weights,
+            num_steps=num_steps,
+            eta=eta,
         )
-
-        timesteps = diffusion.get_sampling_timesteps(num_steps, device=device)
-        x_t = torch.randn(B, N, 2, device=device)
-
-        for t_scalar, t_prev_scalar in zip(timesteps[:-1], timesteps[1:]):
-            t_batch      = torch.full((B,), int(t_scalar),      device=device, dtype=torch.long)
-            t_prev_batch = torch.full((B,), int(t_prev_scalar), device=device, dtype=torch.long)
-
-            eps_hat = self._decode_actions(
-                actions_t=x_t,
-                positions=positions,
-                t=t_batch,
-                memory=memory,
-                memory_positions=positions,
-                attn_mask=attn_mask,
-            )
-            x_t = diffusion.ddim_step(x_t=x_t, t=t_batch, t_prev=t_prev_batch, eps_hat=eps_hat, eta=eta)
-
-        return x_t

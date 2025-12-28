@@ -305,7 +305,7 @@ def main() -> None:
         f"Edge Weights: {tuple(val_dataset.edge_weights.shape)}"
     )
 
-    # Load action normalization stats if present (for later sampling / sim2real)
+    # Load action normalization stats 
     actions_mean_path = data_dir / "actions_mean.pt"
     actions_std_path = data_dir / "actions_std.pt"
     actions_mean = None
@@ -317,7 +317,6 @@ def main() -> None:
     # Create model (uses CNNBackBone + DiffusionModel from config)
     model = DiffusionPolicy(config).to(device)
 
-    # If we have pre-computed normalization stats, store them in the model buffers
     if actions_mean is not None and actions_std is not None:
         with torch.no_grad():
             # Make sure the shapes are broadcastable to (B, N, 2)
@@ -352,6 +351,9 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     best_val_loss = float("inf")
+    val_patience = int(diff_train_cfg.get("ValPatience", 500))
+    val_min_delta = float(diff_train_cfg.get("ValMinDelta", 1e-4))
+    no_improve = 0
 
     for epoch in range(1, num_epochs + 1):
         train_loss = train_one_epoch(model, diffusion, train_loader, optimizer, device)
@@ -362,8 +364,9 @@ def main() -> None:
             f"val_loss = {val_loss:.6f}"
         )
 
-        if val_loss < best_val_loss:
+        if val_loss < (best_val_loss - val_min_delta):
             best_val_loss = val_loss
+            no_improve = 0
             state_dict = model.state_dict()
 
             torch.save(
@@ -378,7 +381,12 @@ def main() -> None:
 
             print(f"  -> Saved best model to: {best_model_path}")
 
-    # Optional: test set evaluation
+        else:
+            no_improve += 1
+            if no_improve >= val_patience:
+                print(f"Early stopping: no val improvement for {val_patience} epochs (min_delta={val_min_delta}).")
+                break
+    # test set evaluation
     test_dataset = DiffusionDataset(data_dir, "test", use_comm_map, world_size)
     test_loader = DataLoader(
         test_dataset,
