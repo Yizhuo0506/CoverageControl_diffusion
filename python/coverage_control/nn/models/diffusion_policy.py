@@ -191,7 +191,6 @@ class RotaryMultiHeadAttention(nn.Module):
         d_model: int,
         num_heads: int,
         dropout: float = 0.0,
-        rope_base_theta: float = 10_000.0,
         rope_period: float = 1024.0,
         use_rope: bool = True,
     ) -> None:
@@ -210,14 +209,16 @@ class RotaryMultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
-        plane_dim = self.head_dim // 2
-        inv_freq = 1.0 / (rope_base_theta ** (torch.arange(0, plane_dim, 2, dtype=torch.float32) / plane_dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.rope_scale = (2.0 * math.pi) / float(rope_period)
-
-    def _sin_cos(self, angles: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # angles: (B, N) -> (B, 1, N, plane_dim/2)
-        freqs = torch.einsum("bn,d->bnd", angles.to(self.inv_freq.dtype), self.inv_freq)
+        # Paper-aligned 2D RoPE frequencies
+        #   ω_i = 2π · τ^{-4i/D},  i = 1..D/4,  τ = RoPEPeriod,  D = head_dim   
+        num_freq = self.head_dim // 4
+        i = torch.arange(1, num_freq + 1, dtype=torch.float32)
+        omega = (2.0 * math.pi) * (float(rope_period) ** (-4.0 * i / float(self.head_dim)))
+        self.register_buffer("omega", omega, persistent=False)
+    
+    def _sin_cos(self, coords: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]: 
+        # coords: (B, N) in meters -> (B, 1, N, head_dim/4)
+        freqs = torch.einsum("bn,d->bnd", coords.to(self.omega.dtype), self.omega)
         return freqs.sin().unsqueeze(1), freqs.cos().unsqueeze(1)
 
     @staticmethod
@@ -232,12 +233,8 @@ class RotaryMultiHeadAttention(nn.Module):
     def _apply_rope_2d(self, x: torch.Tensor, pos_2d: torch.Tensor) -> torch.Tensor:
         # x: (B, H, N, head_dim), pos_2d: (B, N, 2)
         plane_dim = x.shape[-1] // 2
-        ang_x = pos_2d[..., 0] * self.rope_scale
-        ang_y = pos_2d[..., 1] * self.rope_scale
-
-        sin_x, cos_x = self._sin_cos(ang_x)
-        sin_y, cos_y = self._sin_cos(ang_y)
-
+        sin_x, cos_x = self._sin_cos(pos_2d[..., 0])
+        sin_y, cos_y = self._sin_cos(pos_2d[..., 1])
         x_plane, y_plane = x.split(plane_dim, dim=-1)
         x_plane = self._rotate_pairs(x_plane, sin_x, cos_x)
         y_plane = self._rotate_pairs(y_plane, sin_y, cos_y)
@@ -293,7 +290,6 @@ class SpatialEncoderLayer(nn.Module):
         num_heads: int,
         ff_mult: int = 4,
         dropout: float = 0.0,
-        rope_base_theta: float = 10_000.0,
         rope_period: float = 1024.0, 
     ) -> None:
         super().__init__()
@@ -301,12 +297,11 @@ class SpatialEncoderLayer(nn.Module):
             d_model=d_model,
             num_heads=num_heads,
             dropout=dropout,
-            rope_base_theta=rope_base_theta,
             rope_period=rope_period,
         )
         self.ff = nn.Sequential(
             nn.Linear(d_model, ff_mult * d_model),
-            nn.GELU(),
+            nn.LeakyReLU(negative_slope=0.01),
             nn.Linear(ff_mult * d_model, d_model),
         )
         self.norm1 = nn.LayerNorm(d_model)
@@ -342,24 +337,23 @@ class SpatialDecoderLayer(nn.Module):
         num_heads: int,
         ff_mult: int = 4,
         dropout: float = 0.0,
-        rope_base_theta: float = 10_000.0,
         rope_period: float = 1024.0,
         use_rope: bool = True,
     ) -> None:
         super().__init__()
         self.self_attn = RotaryMultiHeadAttention(
             d_model=d_model, num_heads=num_heads, dropout=dropout,
-            rope_base_theta=rope_base_theta, rope_period=rope_period,
+            rope_period=rope_period,
             use_rope=use_rope,
         )
         self.cross_attn = RotaryMultiHeadAttention(
             d_model=d_model, num_heads=num_heads, dropout=dropout,
-            rope_base_theta=rope_base_theta, rope_period=rope_period,
+            rope_period=rope_period,
             use_rope=use_rope,
         )
         self.ff = nn.Sequential(
             nn.Linear(d_model, ff_mult * d_model),
-            nn.GELU(),
+            nn.LeakyReLU(negative_slope=0.01),
             nn.Linear(ff_mult * d_model, d_model),
         )
         self.norm1 = nn.LayerNorm(d_model)
@@ -442,29 +436,29 @@ class DiffusionPolicy(nn.Module):
         dropout = diff_cfg.get("Dropout", 0.0)
         ff_mult = diff_cfg.get("HiddenMultiplier", 4)
         self.attn_radius: Optional[float] = diff_cfg.get("AttentionRadius", None)
-        rope_base_theta: float = diff_cfg.get("RoPEBaseTheta", 10_000.0)
         rope_period: float = float(diff_cfg.get("RoPEPeriod", 1024.0))
 
         # Action embedding: 2D actions -> d_model
         self.action_mlp = nn.Sequential(
             nn.Linear(2, d_model),
-            nn.SiLU(),
+            nn.LeakyReLU(negative_slope=0.01),
             nn.Linear(d_model, d_model),
         )
 
         # Position embedding (absolute MLP, RoPE handles relative geometry)
         self.pos_mlp = nn.Sequential(
             nn.Linear(2, d_model),
-            nn.SiLU(),
+            nn.LeakyReLU(negative_slope=0.01),
             nn.Linear(d_model, d_model),
         )
+        self.obs_token_proj = nn.Linear(d_model + 2, d_model)
 
         # Timestep embedding: sinusoidal + MLP
         time_dim = diff_cfg.get("TimeEmbeddingDim", d_model)
         self.time_dim = time_dim
         self.time_mlp = nn.Sequential(
             nn.Linear(time_dim, d_model),
-            nn.SiLU(),
+            nn.LeakyReLU(negative_slope=0.01),
             nn.Linear(d_model, d_model),
         )
 
@@ -475,7 +469,6 @@ class DiffusionPolicy(nn.Module):
                 num_heads=num_heads,
                 ff_mult=ff_mult,
                 dropout=dropout,
-                rope_base_theta=rope_base_theta,
                 rope_period=rope_period,
             )
             for _ in range(num_enc_layers)
@@ -487,7 +480,6 @@ class DiffusionPolicy(nn.Module):
                 num_heads=num_heads,
                 ff_mult=ff_mult,
                 dropout=dropout,
-                rope_base_theta=rope_base_theta,
                 rope_period=rope_period,
                 use_rope=(i == 0),
             )
@@ -508,7 +500,7 @@ class DiffusionPolicy(nn.Module):
         self.noise_head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
-            nn.SiLU(),
+            nn.LeakyReLU(negative_slope=0.01),
             nn.Linear(d_model, 2),
         )
 
@@ -655,8 +647,7 @@ class DiffusionPolicy(nn.Module):
             memory: (B, N, D) encoded tokens
             attn_mask: (B, N, N) boolean mask (True=allowed) or None
         """
-        pos_emb = self.pos_mlp(positions)                    # (B, N, D)
-        tokens = z + pos_emb                                 # (B, N, D)
+        tokens = self.obs_token_proj(torch.cat([z, positions], dim=-1))  # (B, N, D)
 
         attn_mask = self._build_attention_mask(positions, edge_weights)  # (B, N, N) or None
 

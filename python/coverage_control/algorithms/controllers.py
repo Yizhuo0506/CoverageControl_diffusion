@@ -241,7 +241,7 @@ class ControllerNN:
             else:
                 raise ValueError(f"[ControllerNN] Unknown PolicyType: {self.policy_type}")
             
-            # --- load action normalization stats from dataset directory (delete if re-train) ---
+            # --- load action normalization stats from dataset directory ---
             if self.policy_type == "DIFFUSION" and hasattr(self, "learning_params"):
                 if self.actions_mean is None or self.actions_std is None:
                     dataset_root = pathlib.Path(IOUtils.sanitize_path(self.learning_params["DataDir"]))
