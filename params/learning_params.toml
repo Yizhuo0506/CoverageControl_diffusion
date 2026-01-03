@@ -56,7 +56,6 @@ HiddenMultiplier = 4
 Dropout          = 0.0
 AttentionRadius  = 256      
 TimeEmbeddingDim = 256 
-RoPEBaseTheta    = 10000.0
 RoPEPeriod = 1024.0
 
 [DiffusionTraining]
